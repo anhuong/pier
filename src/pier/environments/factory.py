@@ -45,6 +45,11 @@ _ENVIRONMENT_REGISTRY: dict[EnvironmentType, _EnvEntry] = {
         "DaytonaEnvironment",
         "daytona",
     ),
+    EnvironmentType.BLUESANDBOX: _EnvEntry(
+        "pier.environments.bluesandbox",
+        "BlueSandboxEnvironment",
+        None,
+    ),
 }
 
 
