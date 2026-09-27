@@ -9,6 +9,13 @@ COMPOSE_BASE_PATH = COMPOSE_DIR / "docker-compose-base.yaml"
 COMPOSE_BUILD_PATH = COMPOSE_DIR / "docker-compose-build.yaml"
 COMPOSE_PREBUILT_PATH = COMPOSE_DIR / "docker-compose-prebuilt.yaml"
 COMPOSE_NO_NETWORK_PATH = COMPOSE_DIR / "docker-compose-no-network.yaml"
+# Host-network override (mirrors Harbor's docker-compose-host-network.yaml).
+# Needed under rootless podman without a user D-Bus session: the default compose
+# bridge network invokes netavark/aardvark-dns, which fails ("Failed to connect
+# to bus: No such file or directory") and the container never starts. network_mode
+# host sidesteps it. Applied only when internet is allowed and HARBOR_DOCKER_HOST_NETWORK
+# (or PIER_DOCKER_HOST_NETWORK) is truthy.
+COMPOSE_HOST_NETWORK_PATH = COMPOSE_DIR / "docker-compose-host-network.yaml"
 COMPOSE_WINDOWS_KEEPALIVE_PATH = COMPOSE_DIR / "docker-compose-windows-keepalive.yaml"
 RESOURCES_COMPOSE_NAME = "docker-compose-resources.json"
 

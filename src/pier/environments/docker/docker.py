@@ -24,6 +24,7 @@ from pier.environments.capabilities import EnvironmentCapabilities
 from pier.environments.docker import (
     COMPOSE_BASE_PATH,
     COMPOSE_BUILD_PATH,
+    COMPOSE_HOST_NETWORK_PATH,
     COMPOSE_NO_NETWORK_PATH,
     COMPOSE_PREBUILT_PATH,
     COMPOSE_WINDOWS_KEEPALIVE_PATH,
@@ -36,6 +37,11 @@ from pier.models.task.config import EnvironmentConfig, TaskOS
 from pier.models.trial.config import ResourceMode, ServiceVolumeConfig
 from pier.models.trial.paths import EnvironmentPaths, TrialPaths
 from pier.utils.env import resolve_env_vars
+
+
+# Matches ANSI/VT100 escape sequences (e.g. color/reset codes) that the podman
+# external-compose provider can leak into command stdout.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def _sanitize_docker_image_name(name: str) -> str:
@@ -99,6 +105,7 @@ class DockerEnvironment(BaseEnvironment):
     _DOCKER_COMPOSE_BUILD_PATH = COMPOSE_BUILD_PATH
     _DOCKER_COMPOSE_PREBUILT_PATH = COMPOSE_PREBUILT_PATH
     _DOCKER_COMPOSE_NO_NETWORK_PATH = COMPOSE_NO_NETWORK_PATH
+    _DOCKER_COMPOSE_HOST_NETWORK_PATH = COMPOSE_HOST_NETWORK_PATH
 
     _DOCKER_COMPOSE_WINDOWS_KEEPALIVE_PATH = COMPOSE_WINDOWS_KEEPALIVE_PATH
 
@@ -351,6 +358,15 @@ class DockerEnvironment(BaseEnvironment):
             paths.append(self._egress_proxy_compose_path)
         elif not self.task_env_config.allow_internet:
             paths.append(self._DOCKER_COMPOSE_NO_NETWORK_PATH)
+        elif os.environ.get(
+            "PIER_DOCKER_HOST_NETWORK",
+            os.environ.get("HARBOR_DOCKER_HOST_NETWORK", ""),
+        ).lower() in ("1", "true", "yes"):
+            # Internet allowed + host-network requested: use host networking so
+            # the container comes up under rootless podman without a user D-Bus
+            # session (the default compose bridge needs aardvark-dns, which fails
+            # "Failed to connect to bus"). Mirrors Harbor's HARBOR_DOCKER_HOST_NETWORK.
+            paths.append(self._DOCKER_COMPOSE_HOST_NETWORK_PATH)
 
         return paths
 
@@ -538,6 +554,89 @@ class DockerEnvironment(BaseEnvironment):
                 f"Stderr: {result.stderr}. "
             )
 
+        return result
+
+    async def _resolve_main_container_id(self) -> str:
+        """Return the concrete container ID of the compose ``main`` service.
+
+        Used by :meth:`_run_docker_cp` so file transfers can target the
+        container directly with ``docker cp`` instead of ``docker compose cp``.
+        """
+        result = await self._run_docker_compose_command(
+            ["ps", "-q", "main"], check=True
+        )
+        # The podman external-compose provider prints a banner and ANSI reset
+        # codes into stdout, which can glue onto the id (e.g. "\x1b[0m<id>").
+        # Match the first hex container-id token instead of trusting the line.
+        stdout = _ANSI_RE.sub("", result.stdout or "")
+        cid = ""
+        for tok in stdout.split():
+            if re.fullmatch(r"[0-9a-fA-F]{12,64}", tok):
+                cid = tok
+                break
+        if not cid:
+            raise RuntimeError(
+                f"Could not resolve 'main' container id for environment "
+                f"{self.environment_name} (docker compose ps -q main returned "
+                f"{stdout!r})."
+            )
+        return cid
+
+    async def _run_docker_cp(
+        self, args: list[str], check: bool = True, timeout_sec: int | None = None
+    ) -> ExecResult:
+        """Run a plain ``docker cp`` against the resolved main container.
+
+        ``args`` uses the compose-style ``main:<path>`` spelling for the
+        container side; the leading ``main:`` token is rewritten to the
+        concrete container id. Plain ``docker cp`` replaces ``docker compose
+        cp`` because compose's copier preserves the host uid:gid, which fails
+        under rootless single-UID podman (``lchown ...: invalid argument``).
+        See run-podman-on-bluevela.md.
+        """
+        cid = await self._resolve_main_container_id()
+        rewritten = [
+            (f"{cid}:{a[len('main:'):]}" if a.startswith("main:") else a)
+            for a in args
+        ]
+        full_command = ["docker", "cp", *rewritten]
+
+        env = self._env_vars.to_env_dict(include_os_env=True)
+        if self._compose_task_env:
+            env.update(self._compose_task_env)
+        if self._persistent_env:
+            env.update(self._persistent_env)
+
+        process = await asyncio.create_subprocess_exec(
+            *full_command,
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            if timeout_sec:
+                stdout_bytes, _ = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout_sec
+                )
+            else:
+                stdout_bytes, _ = await process.communicate()
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            raise RuntimeError(f"docker cp timed out after {timeout_sec} seconds")
+
+        stdout = stdout_bytes.decode(errors="replace") if stdout_bytes else None
+        result = ExecResult(
+            stdout=stdout, stderr=None, return_code=process.returncode or 0
+        )
+        if check and result.return_code != 0:
+            raise RuntimeError(
+                f"docker cp failed for environment {self.environment_name}. "
+                f"Command: {' '.join(full_command)}. "
+                f"Return code: {result.return_code}. "
+                f"Stdout: {result.stdout}. "
+            )
         return result
 
     def _validate_daemon_mode(self) -> None:
